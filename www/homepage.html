@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Demo</title>
+</head>
+
+
+<script type="text/javascript">
+  function loadDoc() {
+  var start_time = new Date().getTime();
+
+  var xhttp = new XMLHttpRequest();
+  xhttp.onreadystatechange = function() {
+  if (this.readyState == 4 && this.status == 200) {
+  
+      document.getElementById("demo").innerHTML =
+      this.responseText.concat(" (" +  ((new Date().getTime()) - (start_time)) + " ms)");
+     }
+  };
+  var body = document.getElementById("body").value
+  xhttp.open("POST", "labels", true);
+  xhttp.setRequestHeader("Accept", "application/json");
+  xhttp.setRequestHeader("Content-type", "application/json");
+  foo = JSON.stringify({"subject" :"", "body": body })
+  xhttp.send(foo);
+
+  return false;
+};
+</script>
+
+<body>
+  Demo..
+
+  <p id="demo"></p>
+
+  <form action="" method="get" onsubmit="return loadDoc();">
+  titre (optionel) :<br>
+  <input type="text" name="subject"><br>
+  contenu de l'annonce :<br>
+  <textarea onkeyup="loadDoc();" name="body" id="body" rows="15" cols="60">The cat was playing in the garden.</textarea>
+  <br><br>
+  <input type="submit">
+</form>
+</body>
+
+</html> 
