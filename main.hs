@@ -4,11 +4,15 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE NoMonomorphismRestriction #-} -- toHtmlRaw
 {-# LANGUAGE MultiParamTypeClasses #-} -- RawHtml
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Main where
 
+import System.Console.CmdArgs
+
 import Data.Char
-import Data.List
+import Data.List (intersect, sort, foldl', (\\))
 import Data.Function (on)
 import Data.Text (Text)
 import Data.Proxy (Proxy(..))
@@ -24,13 +28,31 @@ import Servant.Server
 import Servant.HTML.Lucid
 import Lucid
 import Network.HTTP.Media  ((//), (/:))
-import Network.Wai.Handler.Warp (run)
+import Network.Wai.Handler.Warp as W (run)
 
+import Control.Monad
 -- Hext
 import NLP.Hext.NaiveBayes
 import qualified Data.HashMap.Lazy as H
 import qualified Data.Set as S
 
+data CmdLine = CmdLine { datafile :: String
+                       , stopwordsfile :: String
+                       , labelfile :: String
+                       } deriving (Show, Data, Typeable)
+
+data ServConf = ServConf {
+  model :: BayesModel String,
+  demoPage :: String,
+  labels :: [String],
+  stopword :: [String]
+  }
+
+
+cmdline = CmdLine{datafile = def &= explicit &= name "data" &= help "data file" &= opt "data.txt" &= typ "FILE",
+                 stopwordsfile = def &= explicit &= name "stopwords" &= help "stopwords,one per line" &= opt "stopwords.txt" &= typ "FILE",
+                 labelfile = def &= explicit &= name "labels" &= help "labels,one per line"  &= opt "labels.txt" &= typ "FILE"}
+         &= summary "Classifier v1"
 
 autoFill [] foo = []
 autoFill (x:xs) foo = (autoFill xs foo) ++ lookup
@@ -38,25 +60,26 @@ autoFill (x:xs) foo = (autoFill xs foo) ++ lookup
     best_val = head $ (foo `intersect` words x ) ++ [ "unknown" ]
     lookup = [(x, best_val)] 
 
-setup :: IO (ServConf)
-setup = do
-      stopwords_file <- readFile "stopwords.txt"
-      let stopwords = sort(lines stopwords_file)
+setup :: CmdLine -> IO (ServConf)
+setup cmdline = do
+
+      hStopwords <- readFile (stopwordsfile cmdline)
+      let stopwords = sort(lines hStopwords)
       putStrLn $ "\t * Loaded " ++ show(length(stopwords)) ++ " stopwords\n"
 
-      label_file <- readFile "top42_label"
-      let labels = take 550 $ (lines label_file) \\ stopwords
+      hLabels <- readFile (labelfile cmdline)
+      let label_count = 100
+      let labels = take label_count $ (lines hLabels) \\ stopwords
       putStrLn $ "\t * Loaded "
         ++ show(length(labels))
         ++ " valid labels, filtered out "
-        ++ show(length(take 250 $ lines label_file) - length(labels))
+        ++ show(length(take label_count $ lines hLabels) - length(labels))
         ++ " stopwords\n"
 
-      body_file <- readFile "ad_body.txt"
+      body_file <- readFile (datafile cmdline)
 
-      let sample_count = 500
+      let sample_count = 1000
       let samples = take sample_count $ (lines (body_file))
-      let body = take 10 $ samples
 
       putStrLn $ "\t * AutoLabel " ++ show(sample_count) ++ " samples\n"
       let !autoLabeled = autoFill samples labels
@@ -75,19 +98,11 @@ setup = do
  
 main :: IO()
 main = do
+  cmds <- cmdArgs cmdline
   putStrLn "Compute dummy naive bayes ..."
-  conf <- setup
- 
+  conf <- setup cmds
   putStrLn "..Done"
   runServer conf
-
-
-data ServConf = ServConf {
-  model :: BayesModel String,
-  demoPage :: String,
-  labels :: [String],
-  stopword :: [String]
-  }
 
 data Ad = Ad { subject :: String
              , body :: String
@@ -111,6 +126,7 @@ instance FromJSON Ad
 
 instance ToHtml Page where
   toHtml page = toHtmlRaw $ content page
+  toHtmlRaw = toHtmlRaw
 
 getLabelHandler :: ServConf -> Ad -> Handler Label
 getLabelHandler conf ad = do
@@ -132,8 +148,7 @@ labelsServer conf =
 
 runServer :: ServConf -> IO ()
 runServer conf = do
-  run 8000 (serve labelsAPI (labelsServer conf))
-
+  W.run 8000 (serve labelsAPI (labelsServer conf))
 
 
 type LabelsAPI =
