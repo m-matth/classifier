@@ -1,12 +1,15 @@
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 
 import           Data.Aeson             (FromJSON (..), defaultOptions,
                                          genericParseJSON, genericToJSON,
-                                         object, (.=), eitherDecode)
+                                         object, (.=), eitherDecode, encode,
+                                         Value(..))
 import           Data.Text              (Text)
 import           Data.List.Split
-
+import qualified Data.List.NonEmpty     as L
+import qualified Data.Vector            as V
 import qualified Data.ByteString.Lazy   as B
 import           Database.V5.Bloodhound
 import           GHC.Generics           (Generic)
@@ -87,7 +90,7 @@ json_handle adData runBH' = do
   where
     producer c threads atomicPutStrLn = do
 
-      mapM_ (writeChan c) [ x | x <- (chunksOf 20 (take 200 $ (docs adData)))]
+      mapM_ (writeChan c) [ x | x <- (chunksOf 50 (take 1000 $ (docs adData)))]
       mapM_ (writeChan c) [ [] | x <- threads]
       atomicPutStrLn "[main] eof sent, waiting for consumers to finish..."
       mapM_ (\x -> do let
@@ -102,12 +105,78 @@ json_handle adData runBH' = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         x -> do
-             res <- mapM (\x -> do let
-                                   response <- runBH runBH' $ indexDocument testIndex testMapping defaultIndexDocumentSettings x (DocId (list_id x))
-                                   return (list_id x, statusMessage $ responseStatus $ response)) someAds
-             print $ "thread #" ++ show(id) ++ " : "  ++ show res
+             let bulkData = V.fromList [BulkIndex testIndex testMapping (DocId (list_id x)) (toJSON x) | x <- someAds ]
+             res <- runBH runBH' $ bulk bulkData
+             let maybeResult = eitherDecode (responseBody res) :: Either String (BulkResult)
+             case maybeResult of
+               Left err -> print $ "thread #" ++ show(id) ++ " : "  ++  err ++ "\n" ++ show(responseBody res)
+               Right resp -> print $ "thread #" ++ show(id) ++ " : "  ++  (if (errors resp) == False then "no errors" else "some errors") ++ " occurs while bulking " ++ show(length(items resp)) ++ " item(s)"
              dataConsumer id cs print feedback runBH'
 
+
+data BulkItem = BulkItem {
+  _index :: String
+  , _type :: String
+  , _id :: String
+  , _version :: Int
+  , result :: String
+  , _shards :: ShardResult
+  , created :: Bool
+  , status :: Int
+  } deriving (Eq, Read, Show, Generic)
+
+instance FromJSON BulkItem where
+  parseJSON = genericParseJSON defaultOptions
+
+data BulkIndexItem = BulkIndexItem {
+  index :: BulkItem
+  } deriving (Eq, Read, Show, Generic)
+
+instance FromJSON BulkIndexItem where
+  parseJSON = genericParseJSON defaultOptions
+
+data BulkResult = BulkResult {
+  took  :: Int
+  , errors :: Bool
+  , items :: [BulkIndexItem]
+  } deriving (Eq, Read, Show, Generic)
+
+instance FromJSON BulkResult where
+  parseJSON = genericParseJSON defaultOptions
+ 
+data Same = Same {
+  _index :: IndexName
+  , _type :: [Char]
+  ,_id :: [Char]
+  } deriving (Eq, Read, Show, Generic)
+
+data MoreLikeThisObj = MoreLikeThisObj {
+  fields :: Maybe (L.NonEmpty Text)
+  , like :: Maybe (L.NonEmpty Same)
+  , min_term_freq :: Integer
+  , max_query_terms :: Integer
+  } deriving (Show, Generic)
+
+
+instance ToJSON Same where
+  toJSON = genericToJSON defaultOptions
+
+instance ToJSON MoreLikeThisObj where
+  toJSON = genericToJSON defaultOptions
+
+moreLikeThisRequest manager = do
+  -- Create the request
+  let fields = L.nonEmpty ["body","subject" ]
+  let like = L.nonEmpty [Same testIndex "Ad" "1121403928"]
+  let requestObject = object [ "query" .= object [ "more_like_this" .= MoreLikeThisObj fields like 2 12 ] ]
+
+  initialRequest <- applyBasicAuth "elastic" "changeme" <$> parseRequest "http://172.17.0.2:9200/_search"
+  let request = initialRequest { method = "POST", requestBody = RequestBodyLBS $ encode requestObject }
+
+  response <- httpLbs request manager
+{-  putStrLn $ "The status code was: " ++ (show $ statusCode $ responseStatus response)
+  print $ responseBody response -}
+  return response
 
 main :: IO ()
 main = do
@@ -117,12 +186,6 @@ main = do
 
   let runBH'' = (mkBHEnv testServer manager) {bhRequestHook = basicAuthHook (EsUsername "elastic") (EsPassword "changeme")}
 
-{-
-  let query = TermQuery (Term "body" "piano") Nothing
-  let search = mkSearch (Just query) Nothing
-  reply <- runBH runBH'' $ searchAll search
-  print reply
--}
   
   print "Reading input json"
   
@@ -131,3 +194,13 @@ main = do
   case d of
     Left err -> putStrLn err
     Right ps -> json_handle ps runBH''
+
+  response <- moreLikeThisRequest manager
+  let body = responseBody response
+  let d = (eitherDecode body) :: (Either String (SearchResult BsearchDocs))
+
+  case d of
+    Left err -> print err
+    Right ps -> do
+      print $ "found " ++ show (length(hits $ searchHits $ ps)) ++ " result(s)"
+      print [unpackId(hitDocId x) | x <- (hits $ searchHits $ ps)]
