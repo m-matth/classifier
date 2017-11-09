@@ -1,5 +1,8 @@
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeOperators #-}
 
 import           Data.Aeson             (FromJSON (..), defaultOptions,
                                          genericParseJSON, genericToJSON,
@@ -7,13 +10,16 @@ import           Data.Aeson             (FromJSON (..), defaultOptions,
                                          Value(..))
 import           Data.Text              (Text)
 import           Data.List.Split
+import           Data.Proxy (Proxy(..))
 import qualified Data.Vector            as V
 import qualified Data.ByteString.Lazy   as B
 import           Database.V5.Bloodhound
 import           GHC.Generics           (Generic)
 
-import           Network.HTTP.Client (defaultManagerSettings)
-import           Network.HTTP.Client.Internal
+import           Network.HTTP.Client (defaultManagerSettings,
+                                       newManager,
+                                       responseBody)
+--import           Network.HTTP.Client.Internal
 import           Network.HTTP.Types.Status
 
 import           Control.Concurrent
@@ -21,6 +27,12 @@ import           Control.Concurrent.Chan
 
 import qualified Data.List.NonEmpty     as L
 
+import Network.HTTP.Media  ((//), (/:))
+import Network.Wai.Handler.Warp as W (run)
+
+import           Servant.Server
+import Servant.API
+import Lucid
 import           Lib.Utils
 
 data Conf = Conf {
@@ -69,7 +81,7 @@ json_handle adData runBH' = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         x -> do
-             let bulkData = V.fromList [BulkIndex testIndex testMapping (DocId (list_id x)) (toJSON x) | x <- someAds ]
+             let bulkData = V.fromList [BulkIndex testIndex testMapping (DocId (list_id (x :: BsearchDocs))) (toJSON x) | x <- someAds ]
              res <- runBH runBH' $ bulk bulkData
              let maybeResult = eitherDecode (responseBody res) :: Either String (BulkResult)
              case maybeResult of
@@ -79,13 +91,42 @@ json_handle adData runBH' = do
 
 
 
+runServer :: Text -> IO ()
+runServer conf = do
+  W.run 8000 (serve sameAPI (sameServer conf))
+
+
+demo :: Text -> SameApiReq -> Handler SameApiResp
+demo conf req = do
+  return $ SameApiResp [ (1, "2") ]
+
+sameServer conf =
+  (demo conf)
+
+sameAPI :: Proxy SameAPI
+sameAPI = Proxy :: Proxy SameAPI
+
+type SameAPI =
+  "same_docs" :> ReqBody '[JSON] SameApiReq :> Post '[JSON] SameApiResp
+
+data SameApiReq = SameApiReq {
+  list_id :: Integer
+  } deriving (Show, Generic)
+
+data SameApiResp = SameApiResp {
+  same_docs :: [(Integer, Text)]
+  } deriving (Show, Generic)
+
+instance ToJSON SameApiResp
+instance FromJSON SameApiReq
+
+esServer = Server "http://172.17.0.2:9200"
+
 main :: IO ()
 main = do
-  let testServer = Server "http://172.17.0.2:9200"
-
   manager <- newManager defaultManagerSettings
 
-  let runBH'' = (mkBHEnv testServer manager) {bhRequestHook = basicAuthHook (EsUsername "elastic") (EsPassword "changeme")}
+  let runBH'' = (mkBHEnv esServer manager) {bhRequestHook = basicAuthHook (EsUsername "elastic") (EsPassword "changeme")}
 
   
   print "Reading input json"
@@ -108,3 +149,5 @@ main = do
     Right ps -> do
       print $ "found " ++ show (length(hits $ searchHits $ ps)) ++ " result(s)"
       print [unpackId(hitDocId x) | x <- (hits $ searchHits $ ps)]
+
+  runServer "conf"
