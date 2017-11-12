@@ -132,7 +132,8 @@ sameServer manager =
           print $ "Elastic search found " ++ show (length(hits $ searchHits $ ps)) ++ " result(s)"
           let esRes = [unpackId(hitDocId x) | x <- (hits $ searchHits $ ps)]
           print esRes
-          let qs = "J0 lim:10 _cols:list_id,subject,body id:" ++ show(intercalate "," $ [ unpack x | x <- esRes]) ++ "\n"
+          let listIds = intercalate "," $ [ unpack x | x <- esRes]
+          let qs = "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
           bRes <- bSearch "www.jenkins.vdjkslave01.dev.leboncoin.lan" "20010" qs
 --          print $ "bsearch returns : " ++ show bRes ++ "\n"
           return $ Just $ SameApiResp bRes
