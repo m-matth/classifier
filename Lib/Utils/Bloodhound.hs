@@ -97,16 +97,18 @@ instance ToJSON MoreLikeThisObj where
 to an elastic search server
 -}
 moreLikeThisRequest :: Manager
-     -> S.ByteString
-     -> S.ByteString
+     -> String
+     -> String
+     -> String
      -> Maybe (L.NonEmpty Text)
      -> Maybe (L.NonEmpty Same)
      -> IO (Response B.ByteString)
-moreLikeThisRequest manager user passwd fields like = do
+moreLikeThisRequest manager host user passwd fields like = do
   -- Create the request
   let requestObject = object [ "query" .= object [ "more_like_this" .= MoreLikeThisObj fields like 1 12 ] ]
-
-  initialRequest <- applyBasicAuth user passwd <$> parseRequest "http://172.17.0.2:9200/_search"
+  let u = packChars user
+  let p = packChars passwd
+  initialRequest <- applyBasicAuth u p <$> (parseRequest $ host ++ "/_search")
   let request = initialRequest { method = "POST", requestBody = RequestBodyLBS $ encode requestObject }
 
   response <- httpLbs request manager

@@ -51,14 +51,7 @@ import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
 
 import System.Console.CmdArgs
 
-jsonFile :: FilePath
-jsonFile = "ad4.json"
-
-getJSON :: IO BL.ByteString
-getJSON = BL.readFile jsonFile
-
---testIndex = IndexName "test"
-testIndex = IndexName "index2"
+testIndex = IndexName "test"
 testMapping = MappingName "Ad"
 nbWorkers = 10
 
@@ -105,16 +98,16 @@ jsonHandle adData runBH' = do
 policy = simpleCorsResourcePolicy
            { corsRequestHeaders = [ "content-type" ] }
 
-runServer :: Manager -> Int -> String -> String -> IO ()
-runServer manager port bsearchHost bsearchPort = do
-  W.run port (cors (const $ Just policy) $ provideOptions sameAPI  $ serve sameAPI (sameServer manager bsearchHost bsearchPort))
+runServer :: Manager -> Int -> String -> String -> String -> String -> String -> IO ()
+runServer manager port bsearchHost bsearchPort esHost esUser esPasswd = do
+  W.run port (cors (const $ Just policy) $ provideOptions sameAPI  $ serve sameAPI (sameServer manager bsearchHost bsearchPort esHost esUser esPasswd))
 
 sameAPI :: Proxy SameAPI
 sameAPI = Proxy :: Proxy SameAPI
 
 
-sameServer :: Manager -> String -> String -> S.Server SameAPI
-sameServer manager bsearchHost bsearchPort =
+sameServer :: Manager -> String -> String -> String -> String -> String -> S.Server SameAPI
+sameServer manager bsearchHost bsearchPort esHost esUser esPasswd =
   demo
   where
     demo id    = liftIO $ sameGet id
@@ -124,7 +117,7 @@ sameServer manager bsearchHost bsearchPort =
       print $ ">>> " ++ show(list_id (id::SameApiReq))
       let fields = L.nonEmpty ["body","subject" ]
       let like = L.nonEmpty [Same testIndex "Ad" (show(list_id (id::SameApiReq)))]
-      mRes <- moreLikeThisRequest manager "elastic" "changeme" fields like
+      mRes <- moreLikeThisRequest manager esHost esUser esPasswd fields like
       let body = responseBody mRes
       let d = (A.eitherDecode body) :: (Either String (SearchResult BsearchDocs))
 
@@ -171,6 +164,13 @@ data Poc = Import { input :: String
       , bsearch_host :: String
       , bsearch_port :: String
       }
+  | Export {
+      input :: String
+      , trans_host :: String
+      , trans_port :: String
+      , admin :: String
+      , admin_passwd :: String
+      }
   deriving (Show, Data, Typeable)
 
 esHostFlags x = x &= name "es-host" &= explicit &= help "es uri (http://x.x.x.x:9200)" &= typ "URL"
@@ -182,7 +182,15 @@ _import = Import {
   , es_host = esHostFlags  ""
   , es_user = esUserFlags ""
   , es_passwd = esPasswdFlags ""
-  }  &= help "import json data to elastic search"
+  } &= help "import json data to elastic search"
+
+_export = Export {
+  input = def &= name "input" &= help "bsearch json data file" &= typ "FILE"
+  , trans_host = def &= name "trans-host" &= help "trans host" &= typ "HOST"
+  , trans_port = def &= name "trans-port" &= help "trans port" &= typ "PORT"
+  , admin = def &= name "admin" &= help "admin username" &= typ "USERNAME"
+  , admin_passwd = def &= name "admin-passwd" &= help "admin passwd" &= typ "PASSWORD"
+  } &= help "export json data to trans/bdd"
 
 _server = Main.Server {
   port = def &= name "port"  &= help "listen port" &= typ "PORT"
@@ -196,10 +204,10 @@ _server = Main.Server {
 main :: IO ()
 main = do
 
-  cmds <- cmdArgs $ modes [ _import, _server]
+  cmds <- cmdArgs $ modes [ _import, _export, _server]
 
-  let esUser = (if (es_user cmds) /= "" then pack (es_user cmds) else "elastic")
-  let esPasswd = (if (es_passwd cmds) /= "" then pack (es_passwd cmds) else "changeme1")
+  let esUser = (if (es_user cmds) /= "" then es_user cmds else "elastic")
+  let esPasswd = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme1")
 
   manager <- newManager defaultManagerSettings
 
@@ -209,7 +217,9 @@ main = do
       -- esServer = B.Server "http://172.17.0.2:9200"
       let runBH'' = (mkBHEnv (B.Server $ pack esHost) manager)
             {
-              bhRequestHook = basicAuthHook (EsUsername esUser) (EsPassword esPasswd)
+              bhRequestHook = basicAuthHook
+                              (EsUsername $ pack esUser)
+                              (EsPassword $ pack esPasswd)
             }
       print "Reading input json"
       d <- (A.eitherDecode <$> BL.readFile input) :: IO (Either String Bsearch)
@@ -218,7 +228,10 @@ main = do
         Right ps -> jsonHandle ps runBH''
       print "Done"
 
-    Main.Server listen esHost user passwd bsearchHost bsearchPort -> do
+    Export input transHost transPort admin adminPasswd  -> do
+      print "ici"
+
+    Main.Server listen esHost _ _ bsearchHost bsearchPort -> do
       print $ "Server :" ++ show listen
-      runServer manager listen bsearchHost bsearchPort
+      runServer manager listen bsearchHost bsearchPort esHost esUser esPasswd
 
