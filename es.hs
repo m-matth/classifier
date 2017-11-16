@@ -13,6 +13,7 @@ import qualified Data.Aeson             as A (FromJSON (..), defaultOptions,
                                          object, (.=), eitherDecode, encode,
                                          toJSON, Value(..))
 import Data.Text              (Text, pack, unpack)
+import Data.Monoid ((<>))
 import Data.List.Split as S
 import Data.List (intercalate)
 import Data.Proxy (Proxy(..))
@@ -25,7 +26,11 @@ import Database.V5.Bloodhound as B (Server(..), ToJSON(..), SearchResult(..),
                                     BulkOperation(..), MappingName(..),
                                     IndexName(..), DocId(..), runBH,
                                     bhRequestHook, mkBHEnv, basicAuthHook,
-                                    EsUsername(..), EsPassword(..))
+                                    EsUsername(..), EsPassword(..),
+                                    updateIndexAliases, IndexAliasAction(..),
+                                    defaultIndexSettings, createIndex,
+                                    IndexAliasName(..), IndexAlias(..),
+                                    IndexAliasCreate(..))
 
 import Network.HTTP.Client (defaultManagerSettings,
                              newManager,
@@ -51,8 +56,6 @@ import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
 
 import System.Console.CmdArgs
 
-testIndex = IndexName "test"
-testMapping = MappingName "Ad"
 nbWorkers = 10
 
 jsonHandle adData runBH' idx map = do
@@ -87,7 +90,7 @@ jsonHandle adData runBH' idx map = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         x -> do
-             let bulkData = V.fromList [BulkIndex testIndex testMapping (DocId (list_id (x :: BsearchDocs))) (toJSON x) | x <- someAds ]
+             let bulkData = V.fromList [BulkIndex idx map (DocId (list_id (x :: BsearchDocs))) (toJSON x) | x <- someAds ]
              res <- runBH runBH' $ bulk bulkData
              let maybeResult = A.eitherDecode (responseBody res) :: Either String (BulkResult)
              case maybeResult of
@@ -109,6 +112,18 @@ runServer manager port bsearchHost bsearchPort esHost esUser esPasswd idx map = 
 sameAPI :: Proxy SameAPI
 sameAPI = Proxy :: Proxy SameAPI
 
+
+-- hotSwap manager esHost esUser esPasswd esIdx esMap bsearchHost bsearchPort = "foo"
+-- hotSwap :: Manager -> String -> String -> String -> IndexName -> MappingName -> String -> String -> IO()
+hotSwap runBH' esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearchPort = do
+
+  let idx = esIdx
+  let aliasName = esAliasIdx
+  let iAlias = IndexAlias idx (IndexAliasName aliasName)
+  let aliasCreate = IndexAliasCreate Nothing Nothing
+  respIsTwoHunna <- runBH' (createIndex defaultIndexSettings idx)
+  respIsTwoHunna <- runBH' (updateIndexAliases (AddAlias iAlias aliasCreate L.:| []))
+  print $ "Not yet fully implemented"
 
 sameServer :: Manager -> String -> String -> String -> String -> String -> IndexName -> MappingName -> S.Server SameAPI
 sameServer manager bsearchHost bsearchPort esHost esUser esPasswd idx map =
@@ -136,7 +151,6 @@ sameServer manager bsearchHost bsearchPort esHost esUser esPasswd idx map =
           let listIds = intercalate "," $ [ unpack x | x <- esRes]
           let qs = "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
           bRes <- bSearch bsearchHost bsearchPort qs
---          bRes <- bSearch "www.jenkins.vdjkslave01.dev.leboncoin.lan" "20010" qs
 --          print $ "bsearch returns : " ++ show bRes ++ "\n"
           return $ Just $ SameApiResp bRes
 
@@ -179,6 +193,16 @@ data Poc = Import { input :: String
       , admin :: String
       , admin_passwd :: String
       }
+  | HotSwap {
+      es_host :: String
+      , es_user :: String
+      , es_passwd :: String
+      , es_idx :: String
+      , es_alias_idx :: String
+      , es_map :: String
+      , bsearch_host :: String
+      , bsearch_port :: String
+      }
   deriving (Show, Data, Typeable)
 
 esHostFlags x = x &= name "es-host" &= explicit &= help "es uri (http://x.x.x.x:9200)" &= typ "URL"
@@ -186,6 +210,7 @@ esUserFlags x = x &= name "es-user" &= explicit &= help "es username (default el
 esPasswdFlags x = x &= name "es-passwd" &= explicit &= help "es password (default changeme)" &= typ "PASSWORD"
 
 esIdx x = x &= name "es-idx" &= explicit &= help "es index to work on" &= typ "STRING"
+esAliasIdx x = x &= name "es-alias-idx" &= explicit &= help "es alias index to work on" &= typ "STRING"
 esMap x = x &= name "es-map" &= explicit &= help "es map to work on" &= typ "STRING"
 
 _import = Import {
@@ -216,28 +241,38 @@ _server = Main.Server {
   , bsearch_port = def &= help "bsearch port" &= typ "PORT"
   } &= help "serve document similarity api"
 
+_hotswap = HotSwap {
+  es_host = esHostFlags  ""
+  , es_user = esUserFlags ""
+  , es_passwd = esPasswdFlags ""
+  , es_idx = esIdx ""
+  , es_alias_idx = esAliasIdx ""
+  , es_map = esMap ""
+  , bsearch_host = def &= help "bsearch host" &= typ "HOST"
+  , bsearch_port = def &= help "bsearch port" &= typ "PORT"
+  } &= help "index bsearch data and hotswap alias index"
+
 main :: IO ()
 main = do
 
-  cmds <- cmdArgs $ modes [ _import, _export, _server]
+  cmds <- cmdArgs $ modes [ _import, _export, _server, _hotswap ]
+          &= help "manage elastic search poc : api server and utlities"
 
   let esUser = (if (es_user cmds) /= "" then es_user cmds else "elastic")
   let esPasswd = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme1")
   let esIdx = IndexName $ pack $ es_idx cmds
+  let esAliasIdx = IndexName $ pack $ es_alias_idx cmds
   let esMap = MappingName $ pack $ es_map cmds
-
   manager <- newManager defaultManagerSettings
+  let runBH'' = (mkBHEnv (B.Server $ pack (es_host cmds)) manager)
+                {
+                  bhRequestHook = basicAuthHook
+                                  (EsUsername $ pack esUser)
+                                  (EsPassword $ pack esPasswd)
+                }
 
   case cmds of
-    Import input esHost _ _ idx map -> do
-      print $ "Import " ++ show input
-      -- esServer = B.Server "http://172.17.0.2:9200"
-      let runBH'' = (mkBHEnv (B.Server $ pack esHost) manager)
-            {
-              bhRequestHook = basicAuthHook
-                              (EsUsername $ pack esUser)
-                              (EsPassword $ pack esPasswd)
-            }
+    Import input esHost _ _ _ _ -> do
       print "Reading input json"
       d <- (A.eitherDecode <$> BL.readFile input) :: IO (Either String Bsearch)
       case d of
@@ -245,11 +280,13 @@ main = do
         Right ps -> jsonHandle ps runBH'' esIdx esMap
       print "Done"
 
-    Export input transHost transPort admin adminPasswd  -> do
+    Export input transHost transPort admin adminPasswd -> do
       print "not yet implemented"
 
-    Main.Server listen esHost _ _ idx map bsearchHost bsearchPort -> do
-      print $ "Server :" ++ show listen
+    Main.Server listen esHost _ _ _ _ bsearchHost bsearchPort -> do
+      print $ "Server listening on port " ++ show listen
       runServer manager listen bsearchHost bsearchPort
         esHost esUser esPasswd esIdx esMap
 
+    HotSwap esHost _ _ _ _ _ bsearchHost bsearchPort -> do
+      hotSwap (runBH runBH'') esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearchPort
