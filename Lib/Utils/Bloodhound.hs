@@ -72,7 +72,7 @@ to describe a more_like_this content resquest
 -}
 data Same = Same {
   _index :: IndexName
-  , _type :: [Char]
+  , _type :: MappingName
   ,_id :: [Char]
   } deriving (Eq, Read, Show, Generic)
 

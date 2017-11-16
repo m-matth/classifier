@@ -55,7 +55,7 @@ testIndex = IndexName "test"
 testMapping = MappingName "Ad"
 nbWorkers = 10
 
-jsonHandle adData runBH' = do
+jsonHandle adData runBH' idx map = do
   lock <- newMVar ()
   let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
   atomicPutStrLn $ "Launch " ++ show(nbWorkers)++ " to handle data"
@@ -64,7 +64,8 @@ jsonHandle adData runBH' = do
 
   threads <- mapM (\x -> do let
                             feedback <- newChan
-                            _ <- forkIO $ dataConsumer x c atomicPutStrLn feedback runBH'
+                            _ <- forkIO $ dataConsumer x c atomicPutStrLn
+                                                       feedback runBH' idx map
                             return (feedback)) [1..nbWorkers]
   producer c threads atomicPutStrLn
 
@@ -79,7 +80,7 @@ jsonHandle adData runBH' = do
                       return threadRet) threads
       atomicPutStrLn "[main] all consumers end"
 
-    dataConsumer id cs print feedback runBH' = do
+    dataConsumer id cs print feedback runBH' idx map = do
       someAds <- readChan cs
       case length $ someAds  of
         0 -> do
@@ -92,22 +93,25 @@ jsonHandle adData runBH' = do
              case maybeResult of
                Left err -> print $ "thread #" ++ show(id) ++ " : "  ++  err ++ "\n" ++ show(responseBody res)
                Right resp -> print $ "thread #" ++ show(id) ++ " : "  ++  (if (errors resp) == False then "no errors" else "some errors") ++ " occurs while bulking " ++ show(length(items resp)) ++ " item(s)"
-             dataConsumer id cs print feedback runBH'
+             dataConsumer id cs print feedback runBH' idx map
 
 
 policy = simpleCorsResourcePolicy
            { corsRequestHeaders = [ "content-type" ] }
 
-runServer :: Manager -> Int -> String -> String -> String -> String -> String -> IO ()
-runServer manager port bsearchHost bsearchPort esHost esUser esPasswd = do
-  W.run port (cors (const $ Just policy) $ provideOptions sameAPI  $ serve sameAPI (sameServer manager bsearchHost bsearchPort esHost esUser esPasswd))
+runServer :: Manager -> Int -> String -> String -> String -> String -> String -> IndexName -> MappingName -> IO ()
+runServer manager port bsearchHost bsearchPort esHost esUser esPasswd idx map = do
+  W.run port (cors (const $ Just policy) $
+              provideOptions sameAPI  $
+              serve sameAPI (sameServer manager bsearchHost bsearchPort
+                             esHost esUser esPasswd idx map))
 
 sameAPI :: Proxy SameAPI
 sameAPI = Proxy :: Proxy SameAPI
 
 
-sameServer :: Manager -> String -> String -> String -> String -> String -> S.Server SameAPI
-sameServer manager bsearchHost bsearchPort esHost esUser esPasswd =
+sameServer :: Manager -> String -> String -> String -> String -> String -> IndexName -> MappingName -> S.Server SameAPI
+sameServer manager bsearchHost bsearchPort esHost esUser esPasswd idx map =
   demo
   where
     demo id    = liftIO $ sameGet id
@@ -116,7 +120,7 @@ sameServer manager bsearchHost bsearchPort esHost esUser esPasswd =
     sameGet id = do
       print $ ">>> " ++ show(list_id (id::SameApiReq))
       let fields = L.nonEmpty ["body","subject" ]
-      let like = L.nonEmpty [Same testIndex "Ad" (show(list_id (id::SameApiReq)))]
+      let like = L.nonEmpty [Same idx map (show(list_id (id::SameApiReq)))]
       mRes <- moreLikeThisRequest manager esHost esUser esPasswd fields like
       let body = responseBody mRes
       let d = (A.eitherDecode body) :: (Either String (SearchResult BsearchDocs))
@@ -155,12 +159,16 @@ data Poc = Import { input :: String
                   , es_host :: String
                   , es_user :: String
                   , es_passwd :: String
+                  , es_idx :: String
+                  , es_map :: String
                   }
   | Server {
       port :: Int
       , es_host :: String
       , es_user :: String
       , es_passwd :: String
+      , es_idx :: String
+      , es_map :: String
       , bsearch_host :: String
       , bsearch_port :: String
       }
@@ -177,11 +185,16 @@ esHostFlags x = x &= name "es-host" &= explicit &= help "es uri (http://x.x.x.x:
 esUserFlags x = x &= name "es-user" &= explicit &= help "es username (default elastic)"  &= typ "USERNAME"
 esPasswdFlags x = x &= name "es-passwd" &= explicit &= help "es password (default changeme)" &= typ "PASSWORD"
 
+esIdx x = x &= name "es-idx" &= explicit &= help "es index to work on" &= typ "STRING"
+esMap x = x &= name "es-map" &= explicit &= help "es map to work on" &= typ "STRING"
+
 _import = Import {
   input = def &= name "input" &= help "bsearch json data file" &= typ "FILE"
   , es_host = esHostFlags  ""
   , es_user = esUserFlags ""
   , es_passwd = esPasswdFlags ""
+  , es_idx = esIdx ""
+  , es_map = esMap ""
   } &= help "import json data to elastic search"
 
 _export = Export {
@@ -197,6 +210,8 @@ _server = Main.Server {
   , es_host = esHostFlags  ""
   , es_user = esUserFlags ""
   , es_passwd = esPasswdFlags ""
+  , es_idx = esIdx ""
+  , es_map = esMap ""
   , bsearch_host = def &= help "bsearch host" &= typ "HOST"
   , bsearch_port = def &= help "bsearch port" &= typ "PORT"
   } &= help "serve document similarity api"
@@ -208,11 +223,13 @@ main = do
 
   let esUser = (if (es_user cmds) /= "" then es_user cmds else "elastic")
   let esPasswd = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme1")
+  let esIdx = IndexName $ pack $ es_idx cmds
+  let esMap = MappingName $ pack $ es_map cmds
 
   manager <- newManager defaultManagerSettings
 
   case cmds of
-    Import input esHost _ _ -> do
+    Import input esHost _ _ idx map -> do
       print $ "Import " ++ show input
       -- esServer = B.Server "http://172.17.0.2:9200"
       let runBH'' = (mkBHEnv (B.Server $ pack esHost) manager)
@@ -225,13 +242,14 @@ main = do
       d <- (A.eitherDecode <$> BL.readFile input) :: IO (Either String Bsearch)
       case d of
         Left err -> putStrLn err
-        Right ps -> jsonHandle ps runBH''
+        Right ps -> jsonHandle ps runBH'' esIdx esMap
       print "Done"
 
     Export input transHost transPort admin adminPasswd  -> do
-      print "ici"
+      print "not yet implemented"
 
-    Main.Server listen esHost _ _ bsearchHost bsearchPort -> do
+    Main.Server listen esHost _ _ idx map bsearchHost bsearchPort -> do
       print $ "Server :" ++ show listen
-      runServer manager listen bsearchHost bsearchPort esHost esUser esPasswd
+      runServer manager listen bsearchHost bsearchPort
+        esHost esUser esPasswd esIdx esMap
 
