@@ -49,8 +49,10 @@ bSearch server port qs = ST.connect server port $ \(sock, remoteAddr) -> do
         Right ps -> do
           let subjectList = [Docs
                               (list_id (x::BsearchDocs)) $
-                              pack $ subject (x::BsearchDocs) |
-                              x <- (docs ps::[BsearchDocs])]
+                              (case (subject (x::BsearchDocs)) of
+                                  Nothing -> pack $ ""
+                                  Just subject -> subject
+                              ) | x <- (docs ps::[BsearchDocs])]
           return $ Just $ subjectList
 
 {-| 'BsearchInfo' is header of a search engine response
@@ -70,7 +72,7 @@ instance FromJSON BsearchInfo where
 data BsearchDocs = BsearchDocs
   {
     list_id :: Text
-  , subject :: String
+  , subject :: Maybe Text
   , body :: Maybe String
   } deriving (Show, Generic)
 
