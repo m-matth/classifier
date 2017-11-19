@@ -3,6 +3,7 @@
 module Lib.Utils.Blocket
   (
     Bsearch(..)
+  , BsearchInfo(..)
   , BsearchDocs(..)
   , Docs(..)
   , bSearch
@@ -74,10 +75,44 @@ data BsearchDocs = BsearchDocs
     list_id :: Text
   , subject :: Maybe Text
   , body :: Maybe String
+  , list_date :: Maybe Text
+  , email :: Maybe Text
+  , category :: Maybe Text
+  , typ_ :: Maybe Text
+  , ad_type :: Maybe Text
+  , region :: Maybe Text
+  , dpt_code :: Maybe Text
+  , name :: Maybe Text
+  , image :: Maybe Text
+  , phone :: Maybe Text
+  , phone_hidden :: Maybe Text
+  , no_salesmen :: Maybe Text
+  , store_id :: Maybe Text
+  , contact_id :: Maybe Text
+  , company_ad :: Maybe Text
+  , activity_sector :: Maybe Text
+  , extra_images :: Maybe Text
+  , expiration_time :: Maybe Text
+  , orig_date :: Maybe Text
+  , last_edited_tm :: Maybe Text
+  , date :: Maybe Text
+  , city :: Maybe Text
+  , address :: Maybe Text
+  , price :: Maybe Text
+  , zipcode :: Maybe Text
+  , siren :: Maybe Text
+  , pseudo :: Maybe Text
+  , latitude :: Maybe Text
+  , longitude :: Maybe Text
+  , geo_source :: Maybe Text
+  , geo_provider :: Maybe Text
+  , imported :: Maybe Text
+  , suborder :: Maybe Text
   } deriving (Show, Generic)
 
 instance ToJSON BsearchDocs where
   toJSON = genericToJSON defaultOptions
+
 instance FromJSON BsearchDocs where
   parseJSON = genericParseJSON defaultOptions
 

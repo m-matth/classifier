@@ -1,25 +1,20 @@
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
 
 import GHC.Generics (Generic)
 import Control.Monad.IO.Class
 
-import qualified Data.Aeson             as A (FromJSON (..), defaultOptions,
-                                         genericParseJSON, genericToJSON,
-                                         object, (.=), eitherDecode, encode,
-                                         toJSON, Value(..))
+import qualified Data.Aeson as A (FromJSON (..), eitherDecode)
+
 import Data.Text              (Text, pack, unpack)
-import Data.Monoid ((<>))
 import Data.List.Split as S
 import Data.List (intercalate)
 import Data.Proxy (Proxy(..))
 
 import qualified Data.Vector as V
-import qualified Data.ByteString.Lazy as BL
 
 import Database.V5.Bloodhound as B (Server(..), ToJSON(..), SearchResult(..),
                                     bulk, hitDocId, unpackId, hits,
@@ -48,20 +43,25 @@ import Network.Wai.Middleware.Servant.Options
 import Servant.Server as S
 import Servant.API
 
-import Lib.Utils
-import Lib.Utils.Blocket (bSearch, Docs(..)
-                         , BsearchDocs(..), Bsearch(..))
+import Data.Text.Lazy.Encoding as LE
+
+import qualified Lib.Utils.File as UF (readFile')
+import qualified Lib.Utils.Blocket as B (bSearch, Docs(..)
+                         , BsearchDocs(..), Bsearch(..), BsearchInfo(..))
+
 import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
                             Same(..))
 
 import System.Console.CmdArgs
 
+import Data.JsonStream.Parser (parseLazyByteString, objectWithKey, value, arrayOf)
+
 nbWorkers = 10
 
-jsonHandle adData runBH' idx map = do
+jsonHandle docs runBH' idx alias map = do
   lock <- newMVar ()
   let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
-  atomicPutStrLn $ "Launch " ++ show(nbWorkers)++ " to handle data"
+  atomicPutStrLn $ "Launch " ++ show(nbWorkers) ++ " to handle data"
 
   c  <- newChan
 
@@ -75,7 +75,7 @@ jsonHandle adData runBH' idx map = do
   where
     producer c threads atomicPutStrLn = do
 
-      mapM_ (writeChan c) [ x | x <- (S.chunksOf 100 (take 1000000 $ (docs adData)))]
+      mapM_ (writeChan c) [ x | x <- S.chunksOf 100 $ docs]
       mapM_ (writeChan c) [ [] | x <- threads]
       atomicPutStrLn "[main] eof sent, waiting for consumers to finish..."
       mapM_ (\x -> do let
@@ -90,7 +90,7 @@ jsonHandle adData runBH' idx map = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         x -> do
-             let bulkData = V.fromList [BulkIndex idx map (DocId (list_id (x :: BsearchDocs))) (toJSON x) | x <- someAds ]
+             let bulkData = V.fromList [BulkIndex idx map (B.DocId (B.list_id (x :: B.BsearchDocs))) (toJSON x) | x <- someAds ]
              res <- runBH runBH' $ bulk bulkData
              let maybeResult = A.eitherDecode (responseBody res) :: Either String (BulkResult)
              case maybeResult of
@@ -102,19 +102,15 @@ jsonHandle adData runBH' idx map = do
 policy = simpleCorsResourcePolicy
            { corsRequestHeaders = [ "content-type" ] }
 
-runServer :: Manager -> Int -> String -> String -> String -> String -> String -> IndexName -> MappingName -> IO ()
-runServer manager port bsearchHost bsearchPort esHost esUser esPasswd idx map = do
-  W.run port (cors (const $ Just policy) $
-              provideOptions sameAPI  $
-              serve sameAPI (sameServer manager bsearchHost bsearchPort
-                             esHost esUser esPasswd idx map))
+runServer :: Manager -> Poc -> IO ()
+runServer manager servConf =  do
+  W.run (port servConf) (cors (const $ Just policy)
+                         $ provideOptions sameAPI
+                         $ serve sameAPI (sameServer manager servConf))
 
 sameAPI :: Proxy SameAPI
 sameAPI = Proxy :: Proxy SameAPI
 
-
--- hotSwap manager esHost esUser esPasswd esIdx esMap bsearchHost bsearchPort = "foo"
--- hotSwap :: Manager -> String -> String -> String -> IndexName -> MappingName -> String -> String -> IO()
 hotSwap runBH' esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearchPort = do
 
   let idx = esIdx
@@ -125,32 +121,42 @@ hotSwap runBH' esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearch
   respIsTwoHunna <- runBH' (updateIndexAliases (AddAlias iAlias aliasCreate L.:| []))
   print $ "Not yet fully implemented"
 
-sameServer :: Manager -> String -> String -> String -> String -> String -> IndexName -> MappingName -> S.Server SameAPI
-sameServer manager bsearchHost bsearchPort esHost esUser esPasswd idx map =
+_esUser cmds = (if (esUser cmds) /= "" then esUser cmds else "elastic")
+_esPasswd cmds = (if (esPasswd cmds) /= "" then esPasswd cmds else "changeme")
+_esIdx cmds = IndexName $ pack $ esIdx cmds
+_esAliasIdx cmds = IndexName $ pack $ esAliasIdx cmds
+_esMap cmds = MappingName $ pack $ esMap cmds
+
+sameServer :: Manager -> Poc -> S.Server SameAPI
+sameServer manager conf =
   demo
   where
-    demo id    = liftIO $ sameGet id
+    demo id = liftIO $ sameGet id
 
     sameGet :: SameApiReq -> IO (Maybe SameApiResp)
     sameGet id = do
-      print $ ">>> " ++ show(list_id (id::SameApiReq))
+      print $ ">>> " ++ show(list_id id)
       let fields = L.nonEmpty ["body","subject" ]
-      let like = L.nonEmpty [Same idx map (show(list_id (id::SameApiReq)))]
-      mRes <- moreLikeThisRequest manager esHost esUser esPasswd fields like
+      let like = L.nonEmpty [Same (_esIdx conf) (_esMap conf) (show(list_id id))]
+      mRes <- moreLikeThisRequest manager (esHost conf) (_esUser conf) (_esPasswd conf)
+              fields like
       let body = responseBody mRes
-      let d = (A.eitherDecode body) :: (Either String (SearchResult BsearchDocs))
+      let d = (A.eitherDecode body) :: (Either String (SearchResult B.BsearchDocs))
 
       case d of
         Left err -> do
           print err
           return $ Nothing
         Right ps -> do
-          print $ "Elastic search found " ++ show (length(hits $ searchHits $ ps)) ++ " result(s)"
+          print $ "Elastic search found " ++ show(length $ hits $ searchHits $ ps)
+            ++ " result(s)"
           let esRes = [unpackId(hitDocId x) | x <- (hits $ searchHits $ ps)]
           print esRes
           let listIds = intercalate "," $ [ unpack x | x <- esRes]
           let qs = "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
-          bRes <- bSearch bsearchHost bsearchPort qs
+          bRes <- B.bSearch (bsearchHost conf) (bsearchPort conf)
+            $ "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
+
 --          print $ "bsearch returns : " ++ show bRes ++ "\n"
           return $ Just $ SameApiResp bRes
 
@@ -162,7 +168,7 @@ data SameApiReq = SameApiReq {
   } deriving (Show, Generic)
 
 data SameApiResp = SameApiResp {
-  same_docs :: Maybe [Docs]
+  same_docs :: Maybe [B.Docs]
   } deriving (Show, Generic)
 
 instance ToJSON SameApiResp
@@ -170,21 +176,24 @@ instance A.FromJSON SameApiReq
 
 
 data Poc = Import { input :: String
+                  , decode :: Bool
                   , es_host :: String
                   , es_user :: String
                   , es_passwd :: String
                   , es_idx :: String
+                  , es_alias_idx :: String
                   , es_map :: String
                   }
   | Server {
       port :: Int
-      , es_host :: String
-      , es_user :: String
-      , es_passwd :: String
-      , es_idx :: String
-      , es_map :: String
-      , bsearch_host :: String
-      , bsearch_port :: String
+      , esHost :: String
+      , esUser :: String
+      , esPasswd :: String
+      , esIdx :: String
+      , esAliasIdx :: String
+      , esMap :: String
+      , bsearchHost :: String
+      , bsearchPort :: String
       }
   | Export {
       input :: String
@@ -209,17 +218,19 @@ esHostFlags x = x &= name "es-host" &= explicit &= help "es uri (http://x.x.x.x:
 esUserFlags x = x &= name "es-user" &= explicit &= help "es username (default elastic)"  &= typ "USERNAME"
 esPasswdFlags x = x &= name "es-passwd" &= explicit &= help "es password (default changeme)" &= typ "PASSWORD"
 
-esIdx x = x &= name "es-idx" &= explicit &= help "es index to work on" &= typ "STRING"
-esAliasIdx x = x &= name "es-alias-idx" &= explicit &= help "es alias index to work on" &= typ "STRING"
-esMap x = x &= name "es-map" &= explicit &= help "es map to work on" &= typ "STRING"
+esIdxFlags x = x &= name "es-idx" &= explicit &= help "es index to work on" &= typ "STRING"
+esAliasIdxFlags x = x &= name "es-alias-idx" &= explicit &= help "es alias index to work on" &= typ "STRING"
+esMapFlags x = x &= name "es-map" &= explicit &= help "es map to work on" &= typ "STRING"
 
 _import = Import {
   input = def &= name "input" &= help "bsearch json data file" &= typ "FILE"
+  , decode = def &= name "decode" &= help "decode latin9 input file and convert to utf8 before processing"
   , es_host = esHostFlags  ""
   , es_user = esUserFlags ""
   , es_passwd = esPasswdFlags ""
-  , es_idx = esIdx ""
-  , es_map = esMap ""
+  , es_idx = esIdxFlags ""
+  , es_alias_idx = esAliasIdxFlags ""
+  , es_map = esMapFlags ""
   } &= help "import json data to elastic search"
 
 _export = Export {
@@ -232,25 +243,27 @@ _export = Export {
 
 _server = Main.Server {
   port = def &= name "port"  &= help "listen port" &= typ "PORT"
-  , es_host = esHostFlags  ""
-  , es_user = esUserFlags ""
-  , es_passwd = esPasswdFlags ""
-  , es_idx = esIdx ""
-  , es_map = esMap ""
-  , bsearch_host = def &= help "bsearch host" &= typ "HOST"
-  , bsearch_port = def &= help "bsearch port" &= typ "PORT"
+  , esHost = esHostFlags  ""
+  , esUser = esUserFlags ""
+  , esPasswd = esPasswdFlags ""
+  , esIdx = esIdxFlags ""
+  , esAliasIdx = esAliasIdxFlags ""
+  , esMap = esMapFlags ""
+  , bsearchHost = def &= help "bsearch host" &= typ "HOST"
+  , bsearchPort = def &= help "bsearch port" &= typ "PORT"
   } &= help "serve document similarity api"
 
 _hotswap = HotSwap {
   es_host = esHostFlags  ""
   , es_user = esUserFlags ""
   , es_passwd = esPasswdFlags ""
-  , es_idx = esIdx ""
-  , es_alias_idx = esAliasIdx ""
-  , es_map = esMap ""
+  , es_idx = esIdxFlags ""
+  , es_alias_idx = esAliasIdxFlags ""
+  , es_map = esMapFlags ""
   , bsearch_host = def &= help "bsearch host" &= typ "HOST"
   , bsearch_port = def &= help "bsearch port" &= typ "PORT"
   } &= help "index bsearch data and hotswap alias index"
+
 
 main :: IO ()
 main = do
@@ -259,7 +272,7 @@ main = do
           &= help "manage elastic search poc : api server and utlities"
 
   let esUser = (if (es_user cmds) /= "" then es_user cmds else "elastic")
-  let esPasswd = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme1")
+  let esPasswd = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme")
   let esIdx = IndexName $ pack $ es_idx cmds
   let esAliasIdx = IndexName $ pack $ es_alias_idx cmds
   let esMap = MappingName $ pack $ es_map cmds
@@ -272,21 +285,34 @@ main = do
                 }
 
   case cmds of
-    Import input esHost _ _ _ _ -> do
+    Import {} -> do
       print "Reading input json"
-      d <- (A.eitherDecode <$> BL.readFile input) :: IO (Either String Bsearch)
-      case d of
-        Left err -> putStrLn err
-        Right ps -> jsonHandle ps runBH'' esIdx esMap
-      print "Done"
+
+      stream <- UF.readFile' (input cmds) (8192*1024)
+      print $ decode cmds
+      let inputStream  = (if (decode cmds) == True
+                          then LE.encodeUtf8 $ LE.decodeLatin1 $ stream
+                          else stream)
+      importData inputStream
+
+      where
+        importData stream = do
+          -- do not parse full file for two or more headers
+          let header = take 1 $
+                parseLazyByteString (objectWithKey "info" value) $ stream :: [B.BsearchInfo]
+          print header
+
+          let docs = parseLazyByteString (objectWithKey "docs" (arrayOf value)) $ stream :: [B.BsearchDocs]
+
+          jsonHandle docs runBH'' esIdx esAliasIdx esMap
+          print "Done"
 
     Export input transHost transPort admin adminPasswd -> do
       print "not yet implemented"
 
-    Main.Server listen esHost _ _ _ _ bsearchHost bsearchPort -> do
-      print $ "Server listening on port " ++ show listen
-      runServer manager listen bsearchHost bsearchPort
-        esHost esUser esPasswd esIdx esMap
+    Main.Server {} -> do
+      print $ "Server listening on port " ++ show (port cmds)
+      runServer manager cmds
 
     HotSwap esHost _ _ _ _ _ bsearchHost bsearchPort -> do
       hotSwap (runBH runBH'') esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearchPort
