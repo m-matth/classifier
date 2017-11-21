@@ -47,7 +47,8 @@ import Data.Text.Lazy.Encoding as LE
 
 import qualified Lib.Utils.File as UF (readFile')
 import qualified Lib.Utils.Blocket as B (bSearch, Docs(..)
-                         , BsearchDocs(..), Bsearch(..), BsearchInfo(..))
+                         , BsearchDocs(..), Bsearch(..), BsearchInfo(..)
+                         , authenticateAdmin, newAd, reviewAccept)
 
 import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
                             Same(..))
@@ -58,7 +59,7 @@ import Data.JsonStream.Parser (parseLazyByteString, objectWithKey, value, arrayO
 
 nbWorkers = 10
 
-jsonHandle docs runBH' idx alias map = do
+importData docs runBH' idx alias map = do
   lock <- newMVar ()
   let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
   atomicPutStrLn $ "Launch " ++ show(nbWorkers) ++ " to handle data"
@@ -160,6 +161,49 @@ sameServer manager conf =
 --          print $ "bsearch returns : " ++ show bRes ++ "\n"
           return $ Just $ SameApiResp bRes
 
+
+
+
+exportData docs trans_host trans_port token = do
+  lock <- newMVar ()
+  let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
+  atomicPutStrLn $ "Launch " ++ "5 workers" ++ " to handle data"
+
+  c  <- newChan
+
+  threads <- mapM (\x -> do let
+                            feedback <- newChan
+                            _ <- forkIO $ dataConsumer x c atomicPutStrLn
+                                                       feedback trans_host trans_port token
+                            return (feedback)) [1..5]
+  producer c threads atomicPutStrLn
+
+  where
+    producer c threads atomicPutStrLn = do
+
+      mapM_ (writeChan c) [ x | x <- S.chunksOf 1 $ docs]
+      mapM_ (writeChan c) [ [] | x <- threads]
+      atomicPutStrLn "[main] eof sent, waiting for consumers to finish..."
+      mapM_ (\x -> do let
+                      threadRet <- readChan x
+                      return threadRet) threads
+      atomicPutStrLn "[main] all consumers end"
+
+    dataConsumer id cs print feedback trans_host trans_port token = do
+      someAds <- readChan cs
+      case length $ someAds  of
+        0 -> do
+          print $ "thread #" ++ show(id) ++ " done";
+          writeChan feedback True
+        x -> do
+          adId <- B.newAd trans_host trans_port (head someAds)
+--          print adId
+          status <- B.reviewAccept trans_host trans_port adId token
+--          print $ "thread #" ++ show(id) ++ " status : " ++ status
+          dataConsumer id cs print feedback trans_host trans_port token
+
+
+
 type SameAPI =
   "same_docs" :> ReqBody '[JSON] SameApiReq :> Post '[JSON] (Maybe SameApiResp)
 
@@ -197,6 +241,7 @@ data Poc = Import { input :: String
       }
   | Export {
       input :: String
+      , decode :: Bool
       , trans_host :: String
       , trans_port :: String
       , admin :: String
@@ -235,6 +280,7 @@ _import = Import {
 
 _export = Export {
   input = def &= name "input" &= help "bsearch json data file" &= typ "FILE"
+  , decode = def &= name "decode" &= help "decode latin9 input file and convert to utf8 before processing"
   , trans_host = def &= name "trans-host" &= help "trans host" &= typ "HOST"
   , trans_port = def &= name "trans-port" &= help "trans port" &= typ "PORT"
   , admin = def &= name "admin" &= help "admin username" &= typ "USERNAME"
@@ -265,6 +311,20 @@ _hotswap = HotSwap {
   } &= help "index bsearch data and hotswap alias index"
 
 
+chunkSize = (8192*1024)
+
+loadJsonFile :: FilePath -> Bool -> IO (B.BsearchInfo, [B.BsearchDocs])
+loadJsonFile file decodeFlag = do
+      inputStream <- UF.readFile' file chunkSize
+      let stream  = (if (decodeFlag) == True
+                      then LE.encodeUtf8 $ LE.decodeLatin1 $ inputStream
+                      else inputStream)
+      let hdr = parseLazyByteString (objectWithKey "info" value) $ stream :: [B.BsearchInfo]
+      print $ "1"
+      let docs = parseLazyByteString (objectWithKey "docs" (arrayOf value)) $ stream :: [B.BsearchDocs]
+      print $ "2"
+      return (head hdr, docs)
+
 main :: IO ()
 main = do
 
@@ -286,30 +346,26 @@ main = do
 
   case cmds of
     Import {} -> do
-      print "Reading input json"
+      json <- loadJsonFile (input cmds) (decode cmds)
+      print $ fst json
+      print $ take 1 $ snd json
+--      importData (snd json) runBH'' esIdx esAliasIdx esMap
+      print "Done2"
 
-      stream <- UF.readFile' (input cmds) (8192*1024)
-      print $ decode cmds
-      let inputStream  = (if (decode cmds) == True
-                          then LE.encodeUtf8 $ LE.decodeLatin1 $ stream
-                          else stream)
-      importData inputStream
-
-      where
-        importData stream = do
-          -- do not parse full file for two or more headers
-          let header = take 1 $
-                parseLazyByteString (objectWithKey "info" value) $ stream :: [B.BsearchInfo]
-          print header
-
-          let docs = parseLazyByteString (objectWithKey "docs" (arrayOf value)) $ stream :: [B.BsearchDocs]
-
-          jsonHandle docs runBH'' esIdx esAliasIdx esMap
-          print "Done"
-
-    Export input transHost transPort admin adminPasswd -> do
-      print "not yet implemented"
-
+    Export {} -> do
+      json <- loadJsonFile (input cmds) (decode cmds)
+      token <- B.authenticateAdmin (trans_host cmds) (trans_port cmds) (admin cmds) (admin_passwd cmds)
+--      exportData (snd json)
+      print $ token
+      print $ take 1 $ snd json
+      let docs = take 5000 $ snd json
+      exportData (docs) (trans_host cmds) (trans_port cmds) token
+{-
+      adId <- B.newAd (trans_host cmds) (trans_port cmds) (head $ take 1 $ snd json)
+      print adId
+      status <- B.reviewAccept (trans_host cmds) (trans_port cmds) adId token
+      print status
+-}
     Main.Server {} -> do
       print $ "Server listening on port " ++ show (port cmds)
       runServer manager cmds

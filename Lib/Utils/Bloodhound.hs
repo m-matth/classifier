@@ -8,6 +8,7 @@ module Lib.Utils.Bloodhound
   , MoreLikeThisObj(..)
   , moreLikeThisRequest
   , Same(..)
+  , Location(..)
   ) where
 
 
@@ -115,3 +116,16 @@ moreLikeThisRequest manager host user passwd fields like = do
 {-  putStrLn $ "The status code was: " ++ (show $ statusCode $ responseStatus response)
   print $ responseBody response -}
   return response
+
+
+data Location = Location
+ {
+   lat :: Double
+ , long :: Double
+ } deriving (Show, Generic)
+
+instance FromJSON Location where
+  parseJSON = genericParseJSON defaultOptions
+
+instance ToJSON Location where
+  toJSON = genericToJSON defaultOptions
