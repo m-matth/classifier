@@ -17,7 +17,7 @@ import Data.Proxy (Proxy(..))
 import qualified Data.Vector as V
 
 import Database.V5.Bloodhound as B (Server(..), ToJSON(..), SearchResult(..),
-                                    bulk, hitDocId, unpackId, hits,
+                                    bulk, Hit(..), unpackId, hits,
                                     BulkOperation(..), MappingName(..),
                                     IndexName(..), DocId(..), runBH,
                                     bhRequestHook, mkBHEnv, basicAuthHook,
@@ -25,7 +25,8 @@ import Database.V5.Bloodhound as B (Server(..), ToJSON(..), SearchResult(..),
                                     updateIndexAliases, IndexAliasAction(..),
                                     defaultIndexSettings, createIndex,
                                     IndexAliasName(..), IndexAlias(..),
-                                    IndexAliasCreate(..))
+                                    IndexAliasCreate(..), refreshIndex,
+                                    putMapping)
 
 import Network.HTTP.Client (defaultManagerSettings,
                              newManager,
@@ -48,10 +49,11 @@ import Data.Text.Lazy.Encoding as LE
 import qualified Lib.Utils.File as UF (readFile')
 import qualified Lib.Utils.Blocket as B (bSearch, Docs(..)
                          , BsearchDocs(..), Bsearch(..), BsearchInfo(..)
-                         , authenticateAdmin, newAd, reviewAccept)
+                         , authenticateAdmin, newAd, reviewAccept
+                         , BsearchDocsMapping(..))
 
 import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
-                            Same(..))
+                            Same(..), Location(..))
 
 import System.Console.CmdArgs
 
@@ -60,9 +62,13 @@ import Data.JsonStream.Parser (parseLazyByteString, objectWithKey, value, arrayO
 nbWorkers = 10
 
 importData docs runBH' idx alias map = do
+
+  _ <- runBH runBH' (createIndex defaultIndexSettings idx)
+  _ <- runBH runBH' $ putMapping idx map B.BsearchDocsMapping
+
   lock <- newMVar ()
   let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
-  atomicPutStrLn $ "Launch " ++ show(nbWorkers) ++ " to handle data"
+  atomicPutStrLn $ "Launch " ++ show nbWorkers ++ " worker(s) to handle data"
 
   c  <- newChan
 
@@ -73,10 +79,14 @@ importData docs runBH' idx alias map = do
                             return (feedback)) [1..nbWorkers]
   producer c threads atomicPutStrLn
 
+  putStrLn $ "[main] reindexing " ++ show idx
+  _ <- runBH runBH' $ B.refreshIndex idx
+  putStrLn $ "[main] reindexing done"
+
   where
     producer c threads atomicPutStrLn = do
 
-      mapM_ (writeChan c) [ x | x <- S.chunksOf 100 $ docs]
+      mapM_ (writeChan c) [ x | x <- S.chunksOf 500 $ docs]
       mapM_ (writeChan c) [ [] | x <- threads]
       atomicPutStrLn "[main] eof sent, waiting for consumers to finish..."
       mapM_ (\x -> do let
@@ -91,13 +101,13 @@ importData docs runBH' idx alias map = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         x -> do
-             let bulkData = V.fromList [BulkIndex idx map (B.DocId (B.list_id (x :: B.BsearchDocs))) (toJSON x) | x <- someAds ]
-             res <- runBH runBH' $ bulk bulkData
-             let maybeResult = A.eitherDecode (responseBody res) :: Either String (BulkResult)
-             case maybeResult of
-               Left err -> print $ "thread #" ++ show(id) ++ " : "  ++  err ++ "\n" ++ show(responseBody res)
-               Right resp -> print $ "thread #" ++ show(id) ++ " : "  ++  (if (errors resp) == False then "no errors" else "some errors") ++ " occurs while bulking " ++ show(length(items resp)) ++ " item(s)"
-             dataConsumer id cs print feedback runBH' idx map
+          let bulkData = V.fromList [BulkIndex idx map (B.DocId (B.list_id (x :: B.BsearchDocs))) (toJSON x) | x <- someAds ]
+          res <- runBH runBH' $ bulk bulkData
+          let maybeResult = A.eitherDecode (responseBody res) :: Either String (BulkResult)
+          case maybeResult of
+            Left err -> print $ "thread #" ++ show(id) ++ " : "  ++  err ++ "\n" ++ show(responseBody res)
+            Right resp -> print $ "thread #" ++ show(id) ++ " : "  ++  (if (errors resp) == False then "no errors" else "some errors") ++ " occurs while bulking " ++ show(length(items resp)) ++ " item(s)"
+          dataConsumer id cs print feedback runBH' idx map
 
 
 policy = simpleCorsResourcePolicy
@@ -122,11 +132,11 @@ hotSwap runBH' esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearch
   respIsTwoHunna <- runBH' (updateIndexAliases (AddAlias iAlias aliasCreate L.:| []))
   print $ "Not yet fully implemented"
 
-_esUser cmds = (if (esUser cmds) /= "" then esUser cmds else "elastic")
-_esPasswd cmds = (if (esPasswd cmds) /= "" then esPasswd cmds else "changeme")
-_esIdx cmds = IndexName $ pack $ esIdx cmds
-_esAliasIdx cmds = IndexName $ pack $ esAliasIdx cmds
-_esMap cmds = MappingName $ pack $ esMap cmds
+_esUser cmds = (if (es_user cmds) /= "" then es_user cmds else "elastic")
+_esPasswd cmds = (if (es_passwd cmds) /= "" then es_passwd cmds else "changeme")
+_esIdx cmds = IndexName $ pack $ es_idx cmds
+_esAliasIdx cmds = IndexName $ pack $ es_alias_idx cmds
+_esMap cmds = MappingName $ pack $ es_map cmds
 
 sameServer :: Manager -> Poc -> S.Server SameAPI
 sameServer manager conf =
@@ -139,69 +149,87 @@ sameServer manager conf =
       print $ ">>> " ++ show(list_id id)
       let fields = L.nonEmpty ["body","subject" ]
       let like = L.nonEmpty [Same (_esIdx conf) (_esMap conf) (show(list_id id))]
-      mRes <- moreLikeThisRequest manager (esHost conf) (_esUser conf) (_esPasswd conf)
-              fields like
+      mRes <- moreLikeThisRequest manager (es_host conf) (_esUser conf) (_esPasswd conf)
+              fields like True
       let body = responseBody mRes
       let d = (A.eitherDecode body) :: (Either String (SearchResult B.BsearchDocs))
 
       case d of
         Left err -> do
           print err
-          return $ Nothing
+          return $ Just $ SameApiResp Nothing
         Right ps -> do
           print $ "Elastic search found " ++ show(length $ hits $ searchHits $ ps)
             ++ " result(s)"
-          let esRes = [unpackId(hitDocId x) | x <- (hits $ searchHits $ ps)]
-          print esRes
-          let listIds = intercalate "," $ [ unpack x | x <- esRes]
-          let qs = "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
-          bRes <- B.bSearch (bsearchHost conf) (bsearchPort conf)
-            $ "J0 lim:10 _cols:list_id,subject,body id:" ++ listIds ++ "\n"
+          case hits $ searchHits $ ps of
+            [] -> do
+              return $ Just $ SameApiResp Nothing
+            _ -> do
+              let esRes = [unpackId(hitDocId x)
+                          | x <- (hits $ searchHits $ ps)
+                          , unpack(unpackId(hitDocId x)) /= (show (list_id id))]
+              let loc = head $ [extract_location (hitSource x)
+                               | x <- (hits $ searchHits $ ps)
+                               , unpack(unpackId(hitDocId x)) == (show (list_id id))]
+              -- print loc
+              let listIds = intercalate "," $ [ unpack x | x <- esRes]
+              let qs = "J0 lim:20 _cols:list_id,subject,body,zipcode,city id:" ++ listIds
+                    ++ " distance_range:(" ++ show (lat loc) ++
+                    "," ++ show (lon loc) ++ "),250000\n"
+              bRes <- B.bSearch (bsearch_host conf) (bsearch_port conf) $ qs
+              -- print $ "bsearch returns : " ++ show bRes ++ "\n"
+              case bRes of
+                Nothing -> do
+                  return $ Just $ SameApiResp Nothing
+                Just [] -> do
+                  return $ Just $ SameApiResp Nothing
+                Just bdocs -> do
+                  let esDoc = [ hitSource x | x <- (hits $ searchHits $ ps) ]
+                  let bestScoreWithLoc = [ y | x <- (hits $ searchHits $ ps)
+                                           , y <- bdocs
+                                           , unpackId(hitDocId x) == (B.id y)]
+                  -- print $ bestScoreWithLoc
+                  return $ Just $ SameApiResp $ Just bestScoreWithLoc
 
---          print $ "bsearch returns : " ++ show bRes ++ "\n"
-          return $ Just $ SameApiResp bRes
+            where
+              extract_location doc = do
+                case doc of
+                  Nothing -> Location 42.2 0.0
+                  Just doc -> B.location doc
 
 
-
-
-exportData docs trans_host trans_port token = do
-  lock <- newMVar ()
-  let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
-  atomicPutStrLn $ "Launch " ++ "5 workers" ++ " to handle data"
-
+exportData docs trans_host trans_port = do
   c  <- newChan
 
-  threads <- mapM (\x -> do let
-                            feedback <- newChan
-                            _ <- forkIO $ dataConsumer x c atomicPutStrLn
-                                                       feedback trans_host trans_port token
-                            return (feedback)) [1..5]
-  producer c threads atomicPutStrLn
+  threads <- mapM (\id -> do
+                      feedback <- newChan
+                      _ <- forkIO $ dataConsumer id c feedback trans_host trans_port 0
+                      return (feedback)) [1..1]
+  producer c threads
 
   where
-    producer c threads atomicPutStrLn = do
+    producer c threads = do
 
       mapM_ (writeChan c) [ x | x <- S.chunksOf 1 $ docs]
       mapM_ (writeChan c) [ [] | x <- threads]
-      atomicPutStrLn "[main] eof sent, waiting for consumers to finish..."
+
+      print "[main] eof sent, waiting for consumers to finish..."
       mapM_ (\x -> do let
                       threadRet <- readChan x
                       return threadRet) threads
-      atomicPutStrLn "[main] all consumers end"
+      print "[main] all consumers end"
 
-    dataConsumer id cs print feedback trans_host trans_port token = do
+    dataConsumer id cs feedback trans_host trans_port acc = do
       someAds <- readChan cs
-      case length $ someAds  of
-        0 -> do
+      case someAds  of
+        [] -> do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
-        x -> do
-          adId <- B.newAd trans_host trans_port (head someAds)
---          print adId
-          status <- B.reviewAccept trans_host trans_port adId token
---          print $ "thread #" ++ show(id) ++ " status : " ++ status
-          dataConsumer id cs print feedback trans_host trans_port token
-
+        _ -> do
+          let email = "foo_" ++ show id ++ "_" ++ show acc ++ "@foo.org"
+          let doc = (head someAds) { B.store_id = Just $ pack $ show (acc + (id * 1000000)) }
+          adId <- B.newAd trans_host trans_port doc email
+          dataConsumer id cs feedback trans_host trans_port (acc + 1)
 
 
 type SameAPI =
@@ -218,7 +246,6 @@ data SameApiResp = SameApiResp {
 instance ToJSON SameApiResp
 instance A.FromJSON SameApiReq
 
-
 data Poc = Import { input :: String
                   , decode :: Bool
                   , es_host :: String
@@ -230,14 +257,14 @@ data Poc = Import { input :: String
                   }
   | Server {
       port :: Int
-      , esHost :: String
-      , esUser :: String
-      , esPasswd :: String
-      , esIdx :: String
-      , esAliasIdx :: String
-      , esMap :: String
-      , bsearchHost :: String
-      , bsearchPort :: String
+      , es_host :: String
+      , es_user :: String
+      , es_passwd :: String
+      , es_idx :: String
+      , es_alias_idx :: String
+      , es_map :: String
+      , bsearch_host :: String
+      , bsearch_port :: String
       }
   | Export {
       input :: String
@@ -289,14 +316,14 @@ _export = Export {
 
 _server = Main.Server {
   port = def &= name "port"  &= help "listen port" &= typ "PORT"
-  , esHost = esHostFlags  ""
-  , esUser = esUserFlags ""
-  , esPasswd = esPasswdFlags ""
-  , esIdx = esIdxFlags ""
-  , esAliasIdx = esAliasIdxFlags ""
-  , esMap = esMapFlags ""
-  , bsearchHost = def &= help "bsearch host" &= typ "HOST"
-  , bsearchPort = def &= help "bsearch port" &= typ "PORT"
+  , es_host = esHostFlags  ""
+  , es_user = esUserFlags ""
+  , es_passwd = esPasswdFlags ""
+  , es_idx = esIdxFlags ""
+  , es_alias_idx = esAliasIdxFlags ""
+  , es_map = esMapFlags ""
+  , bsearch_host = def &= help "bsearch host" &= typ "HOST"
+  , bsearch_port = def &= help "bsearch port" &= typ "PORT"
   } &= help "serve document similarity api"
 
 _hotswap = HotSwap {
@@ -347,25 +374,16 @@ main = do
   case cmds of
     Import {} -> do
       json <- loadJsonFile (input cmds) (decode cmds)
-      print $ fst json
       print $ take 1 $ snd json
---      importData (snd json) runBH'' esIdx esAliasIdx esMap
+      importData (snd json) runBH'' esIdx esAliasIdx esMap
       print "Done2"
 
     Export {} -> do
       json <- loadJsonFile (input cmds) (decode cmds)
-      token <- B.authenticateAdmin (trans_host cmds) (trans_port cmds) (admin cmds) (admin_passwd cmds)
---      exportData (snd json)
-      print $ token
       print $ take 1 $ snd json
-      let docs = take 5000 $ snd json
-      exportData (docs) (trans_host cmds) (trans_port cmds) token
-{-
-      adId <- B.newAd (trans_host cmds) (trans_port cmds) (head $ take 1 $ snd json)
-      print adId
-      status <- B.reviewAccept (trans_host cmds) (trans_port cmds) adId token
-      print status
--}
+      let docs = snd json
+      exportData (docs) (trans_host cmds) (trans_port cmds)
+
     Main.Server {} -> do
       print $ "Server listening on port " ++ show (port cmds)
       runServer manager cmds

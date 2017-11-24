@@ -85,6 +85,8 @@ data MoreLikeThisObj = MoreLikeThisObj {
   , like :: Maybe (L.NonEmpty Same)
   , min_term_freq :: Integer
   , max_query_terms :: Integer
+  , include :: Bool
+  , minimum_should_match :: String
   } deriving (Show, Generic)
 
 instance ToJSON Same where
@@ -93,6 +95,8 @@ instance ToJSON Same where
 instance ToJSON MoreLikeThisObj where
   toJSON = genericToJSON defaultOptions
 
+defaultSize :: Integer
+defaultSize = 100
 
 {- | 'moreLikeThisRequest' send a more_like_this request
 to an elastic search server
@@ -103,10 +107,11 @@ moreLikeThisRequest :: Manager
      -> String
      -> Maybe (L.NonEmpty Text)
      -> Maybe (L.NonEmpty Same)
+     -> Bool
      -> IO (Response B.ByteString)
-moreLikeThisRequest manager host user passwd fields like = do
+moreLikeThisRequest manager host user passwd fields like include = do
   -- Create the request
-  let requestObject = object [ "query" .= object [ "more_like_this" .= MoreLikeThisObj fields like 1 12 ] ]
+  let requestObject = object [ "query" .= object [ "more_like_this" .= MoreLikeThisObj fields like 1 5 include "30%" ], "size" .= defaultSize ]
   let u = packChars user
   let p = packChars passwd
   initialRequest <- applyBasicAuth u p <$> (parseRequest $ host ++ "/_search")
@@ -121,7 +126,7 @@ moreLikeThisRequest manager host user passwd fields like = do
 data Location = Location
  {
    lat :: Double
- , long :: Double
+ , lon :: Double
  } deriving (Show, Generic)
 
 instance FromJSON Location where
