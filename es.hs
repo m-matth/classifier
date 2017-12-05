@@ -8,7 +8,7 @@ import GHC.Generics (Generic)
 import Control.Monad.IO.Class
 
 import qualified Data.Aeson as A (FromJSON (..), eitherDecode)
-
+import Control.Concurrent.Thread.Delay
 import Data.Text              (Text, pack, unpack)
 import Data.List.Split as S
 import Data.List (intercalate)
@@ -26,7 +26,7 @@ import Database.V5.Bloodhound as B (Server(..), ToJSON(..), SearchResult(..),
                                     defaultIndexSettings, createIndex,
                                     IndexAliasName(..), IndexAlias(..),
                                     IndexAliasCreate(..), refreshIndex,
-                                    putMapping)
+                                    putMapping, Analyzer(..))
 
 import Network.HTTP.Client (defaultManagerSettings,
                              newManager,
@@ -50,10 +50,11 @@ import qualified Lib.Utils.File as UF (readFile')
 import qualified Lib.Utils.Blocket as B (bSearch, Docs(..)
                          , BsearchDocs(..), Bsearch(..), BsearchInfo(..)
                          , authenticateAdmin, newAd, reviewAccept
-                         , BsearchDocsMapping(..))
+                         , BsearchDocsMapping(..)
+                         , BsearchDocsMapping2(..))
 
 import Lib.Utils.Bloodhound (moreLikeThisRequest, BulkResult(..),
-                            Same(..), Location(..))
+                            Same(..), Location(..), PerFieldAnalyzer(..))
 
 import System.Console.CmdArgs
 
@@ -65,6 +66,11 @@ importData docs runBH' idx alias map = do
 
   _ <- runBH runBH' (createIndex defaultIndexSettings idx)
   _ <- runBH runBH' $ putMapping idx map B.BsearchDocsMapping
+  _ <- runBH runBH' $ putMapping idx map B.BsearchDocsMapping2
+  let iAlias = IndexAlias idx (IndexAliasName alias)
+  let aliasCreate = IndexAliasCreate Nothing Nothing
+  _ <- runBH runBH' (updateIndexAliases (AddAlias iAlias aliasCreate L.:| []))
+
 
   lock <- newMVar ()
   let atomicPutStrLn str = withMVar lock (\_ -> putStrLn str)
@@ -147,8 +153,9 @@ sameServer manager conf =
     sameGet :: SameApiReq -> IO (Maybe SameApiResp)
     sameGet id = do
       print $ ">>> " ++ show(list_id id)
-      let fields = L.nonEmpty ["body","subject" ]
-      let like = L.nonEmpty [Same (_esIdx conf) (_esMap conf) (show(list_id id))]
+      let fields = L.nonEmpty ["category", "body","subject" ]
+      let like = L.nonEmpty [Same (_esIdx conf) (_esMap conf) (show(list_id id)) $
+                             PerFieldAnalyzer "body" (Analyzer "french")]
       mRes <- moreLikeThisRequest manager (es_host conf) (_esUser conf) (_esPasswd conf)
               fields like True
       let body = responseBody mRes
@@ -168,14 +175,16 @@ sameServer manager conf =
               let esRes = [unpackId(hitDocId x)
                           | x <- (hits $ searchHits $ ps)
                           , unpack(unpackId(hitDocId x)) /= (show (list_id id))]
-              let loc = head $ [extract_location (hitSource x)
+              let info = head $ [extract_info (hitSource x)
                                | x <- (hits $ searchHits $ ps)
                                , unpack(unpackId(hitDocId x)) == (show (list_id id))]
+              let loc = fst(info)
               -- print loc
               let listIds = intercalate "," $ [ unpack x | x <- esRes]
-              let qs = "J0 lim:20 _cols:list_id,subject,body,zipcode,city id:" ++ listIds
+              let qs = "J0 lim:20 _cols:list_id,subject,body,zipcode,city,price,image id:" ++ listIds
                     ++ " distance_range:(" ++ show (lat loc) ++
-                    "," ++ show (lon loc) ++ "),250000\n"
+                    "," ++ show (lon loc) ++ "),100000"
+                    ++ snd(info) ++ "\n"
               bRes <- B.bSearch (bsearch_host conf) (bsearch_port conf) $ qs
               -- print $ "bsearch returns : " ++ show bRes ++ "\n"
               case bRes of
@@ -192,11 +201,12 @@ sameServer manager conf =
                   return $ Just $ SameApiResp $ Just bestScoreWithLoc
 
             where
-              extract_location doc = do
+              extract_info doc = do
                 case doc of
-                  Nothing -> Location 42.2 0.0
-                  Just doc -> B.location doc
-
+                  Nothing -> (Location 42.2 0.0, "")
+                  Just doc -> case (B.category doc) of
+                                Nothing -> (B.location doc, "")
+                                Just cat -> (B.location doc, " category_only:" ++ unpack(cat))
 
 exportData docs trans_host trans_port = do
   c  <- newChan
@@ -226,9 +236,11 @@ exportData docs trans_host trans_port = do
           print $ "thread #" ++ show(id) ++ " done";
           writeChan feedback True
         _ -> do
+          delay 50000
           let email = "foo_" ++ show id ++ "_" ++ show acc ++ "@foo.org"
           let doc = (head someAds) { B.store_id = Just $ pack $ show (acc + (id * 1000000)) }
           adId <- B.newAd trans_host trans_port doc email
+          delay 50000
           dataConsumer id cs feedback trans_host trans_port (acc + 1)
 
 
@@ -347,9 +359,7 @@ loadJsonFile file decodeFlag = do
                       then LE.encodeUtf8 $ LE.decodeLatin1 $ inputStream
                       else inputStream)
       let hdr = parseLazyByteString (objectWithKey "info" value) $ stream :: [B.BsearchInfo]
-      print $ "1"
       let docs = parseLazyByteString (objectWithKey "docs" (arrayOf value)) $ stream :: [B.BsearchDocs]
-      print $ "2"
       return (head hdr, docs)
 
 main :: IO ()
@@ -374,9 +384,7 @@ main = do
   case cmds of
     Import {} -> do
       json <- loadJsonFile (input cmds) (decode cmds)
-      print $ take 1 $ snd json
       importData (snd json) runBH'' esIdx esAliasIdx esMap
-      print "Done2"
 
     Export {} -> do
       json <- loadJsonFile (input cmds) (decode cmds)
@@ -390,3 +398,4 @@ main = do
 
     HotSwap esHost _ _ _ _ _ bsearchHost bsearchPort -> do
       hotSwap (runBH runBH'') esHost esUser esPasswd esIdx esAliasIdx esMap bsearchHost bsearchPort
+      print "Done"

@@ -9,6 +9,7 @@ module Lib.Utils.Blocket
   , BsearchInfo(..)
   , BsearchDocs(..)
   , BsearchDocsMapping(..)
+  , BsearchDocsMapping2(..)
   , Docs(..)
   , bSearch
   , authenticateAdmin
@@ -142,6 +143,12 @@ Location during parsing
 -}
   , location :: UB.Location
 
+  , jobcontract :: Maybe Text
+  , jobfield :: Maybe Text
+  , jobduty :: Maybe Text
+  , jobstudy :: Maybe Text
+  , jobtime :: Maybe Text
+  , jobexp :: Maybe Text
   } deriving (Show, Generic)
 
 instance ToJSON BsearchDocs where
@@ -155,6 +162,15 @@ instance ToJSON BsearchDocsMapping where
     object
       [ "properties" .=
         object ["location" .= object ["type" .= ("geo_point" :: Text)]]
+      ]
+
+data BsearchDocsMapping2 = BsearchDocsMapping2 deriving (Eq, Show)
+
+instance ToJSON BsearchDocsMapping2 where
+  toJSON BsearchDocsMapping2 =
+    object
+      [ "properties" .=
+        object ["category" .= object ["similarity" .= ("boolean" :: Text)]]
       ]
 
 defaultLat = 42.0 :: Double
@@ -236,7 +252,7 @@ newAd server port doc email = ST.connect server port $ \(sock, _) -> do
                  Nothing -> "0"
                  Just x -> unpack x)
 
-  if (proAd == "1") then return "" else do
+--  if (proAd == "1") then return "" else do
 
   conv <- open "ISO-8859-1" Nothing
   let b = BI.packChars $ (appendField "body" (body doc))
@@ -249,13 +265,22 @@ newAd server port doc email = ST.connect server port $ \(sock, _) -> do
            ++ appendFieldNotZero "dpt_code" (dpt_code doc)
            ++ appendField "type" (ad_type doc)
            ++ appendField "category" (category doc)
-           ++ "email:" ++ email ++ "\n"
+           ++ "email:" ++ (if proAd == "1" then "matthieu.morel+qa5@schibsted.com" else email) ++ "\n"
            ++ appendField "subject" (subject doc)
+           ++ appendField "jobcontract" (jobcontract doc)
+           ++ appendField "jobfield" (jobfield doc)
+           ++ appendField "jobduty" (jobduty doc)
+           ++ appendField "jobstudy" (jobstudy doc)
+           ++ appendField "jobtime" (jobtime doc)
+           ++ appendField "jobexp" (jobexp doc)
            ++  -- unpack
            unpack bodyLatin
            ++ (if proAd == "1" then appendField "siren" (siren doc) else "")
-           ++ (if proAd == "1" then appendField "store" (store_id doc) else "")
+           ++ (if proAd == "1" then "store:13521\n" else "")
+           ++ (if proAd == "1" then "auth_resource:13521\n" else "")
+--           ++ (if proAd == "1" then appendField "store" (store_id doc) else "")
            ++ (if proAd == "1" then "auth_type:store\n" else "")
+           ++ (if proAd == "1" then "token:0b49eeec-1dd5-4405-9ce1-90a18e2c7e66\n" else "")
 --           ++ appendField "pseudo" (pseudo doc)
 --           ++ appendField "image.0.name" (image doc)
 --           ++ "image.0.digest:091c74518eb959d4b2bfd876e3d3c088ce419eb0\n"
@@ -279,7 +304,7 @@ newAd server port doc email = ST.connect server port $ \(sock, _) -> do
   ST.send sock $ BI.packChars $ qs
   rMsg <- US.recv' sock
 
-  delay 1000
+  delay 2000
 --  print $ rMsg
 
   case rMsg of

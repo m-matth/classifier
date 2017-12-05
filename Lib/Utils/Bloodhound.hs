@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Lib.Utils.Bloodhound
   (
@@ -9,6 +10,7 @@ module Lib.Utils.Bloodhound
   , moreLikeThisRequest
   , Same(..)
   , Location(..)
+  , PerFieldAnalyzer(..)
   ) where
 
 
@@ -18,7 +20,7 @@ import Data.ByteString.Internal
 
 import Data.Aeson (FromJSON (..), ToJSON, defaultOptions,
                    genericParseJSON, genericToJSON, object,
-                   encode, (.=))
+                   encode, (.=), Value(..), (.:?))
 import Network.HTTP.Client.Internal (Manager, Request(..), Response(..),
                                      parseRequest, httpLbs, RequestBody(..),
                                      applyBasicAuth)
@@ -28,6 +30,7 @@ import qualified Data.List.NonEmpty as L
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy   as B
 
+import qualified Data.HashMap.Strict as HM
 
 {-| 'BulkItem' is an extension to Bloodhound data type
 to parse bulk response items
@@ -68,6 +71,12 @@ data BulkResult = BulkResult {
 instance FromJSON BulkResult where
   parseJSON = genericParseJSON defaultOptions
 
+
+data PerFieldAnalyzer = PerFieldAnalyzer {
+  field :: Text
+  , analyzer :: Analyzer
+  } deriving (Eq, Read, Show, Generic)
+
 {- | 'Same' is an extension  to Bloodhound data type
 to describe a more_like_this content resquest
 -}
@@ -75,6 +84,7 @@ data Same = Same {
   _index :: IndexName
   , _type :: MappingName
   ,_id :: [Char]
+  , per_field_analyzer :: PerFieldAnalyzer
   } deriving (Eq, Read, Show, Generic)
 
 {- | 'MoreLikeThisObj' is an extension  to Bloodhound data type
@@ -85,12 +95,25 @@ data MoreLikeThisObj = MoreLikeThisObj {
   , like :: Maybe (L.NonEmpty Same)
   , min_term_freq :: Integer
   , max_query_terms :: Integer
+  , min_word_length :: Integer
   , include :: Bool
   , minimum_should_match :: String
   } deriving (Show, Generic)
 
+
+defField :: Text
+defField = "body"
+
+defAnalyzer :: Text
+defAnalyzer = "french"
+
 instance ToJSON Same where
-  toJSON = genericToJSON defaultOptions
+  toJSON (Same _index _type _id pfa) =
+    object ["_index" .= _index,
+            "_type" .= _type,
+            "_id" .= _id -- ,
+            "per_field_analyzer" .= object [ defField .= defAnalyzer ]
+           ]
 
 instance ToJSON MoreLikeThisObj where
   toJSON = genericToJSON defaultOptions
@@ -111,7 +134,12 @@ moreLikeThisRequest :: Manager
      -> IO (Response B.ByteString)
 moreLikeThisRequest manager host user passwd fields like include = do
   -- Create the request
-  let requestObject = object [ "query" .= object [ "more_like_this" .= MoreLikeThisObj fields like 1 5 include "30%" ], "size" .= defaultSize ]
+  let requestObject = object [
+        "query" .= object [
+            "more_like_this" .= MoreLikeThisObj fields like 1 10 3 include "30%"
+            ],
+          "size" .= defaultSize
+        ]
   let u = packChars user
   let p = packChars passwd
   initialRequest <- applyBasicAuth u p <$> (parseRequest $ host ++ "/_search")
